@@ -4,6 +4,7 @@ import logging
 from fitparse import FitFile
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
+from matplotlib.animation import PillowWriter
 from matplotlib.animation import FFMpegWriter
 from geopy.distance import geodesic
 from pyproj import Transformer
@@ -71,6 +72,49 @@ class RideRouteAnimator:
         if not self.track:
             logger.error("No valid track points found in FIT file.")
             raise SystemExit("No valid data found in FIT file.")
+    
+    def compute_moving_time(self):
+        """Calculate moving time using time delta and speed threshold"""
+        moving_time = 0
+        speed_threshold = 2.0  # m/s ≈ 7.2 km/h
+
+        for i in range(1, len(self.track)):
+            speed = self.speeds[i]
+            if speed and speed > speed_threshold:
+                t1 = self.track[i-1]['time']
+                t2 = self.track[i]['time']
+                delta = (t2 - t1).total_seconds()
+                moving_time += delta
+        return moving_time
+
+    def compute_elevation_gain(self):
+        """Calculate elevation gain with minimum segment length and gradient filtering"""
+        # Basic elevation gain calculation (commented out)
+        # self.elevation_gain = sum(
+        #     max(self.elevations[i] - self.elevations[i-1], 0)
+        #     for i in range(1, len(self.elevations))
+        #     if abs(self.elevations[i] - self.elevations[i-1]) > 3
+        # )
+        gain = 0
+        accum_elev = 0
+        accum_dist = 0
+        min_segment = 100 # meters
+        min_gradient = 0.005    # 0.5%
+
+        for i in range(1, len(self.elevations)):
+            delta_elev = self.elevations[i] - self.elevations[i-1]
+            delta_dist = self.distances[i] - self.distances[i-1]
+
+            accum_dist += delta_dist
+            accum_elev += delta_elev
+                
+            if accum_dist >= min_segment:
+                gradient = accum_elev / accum_dist
+                if gradient >= min_gradient:
+                    gain += accum_elev
+                accum_elev = 0
+                accum_dist = 0
+        return gain 
 
     def compute_geometry(self):
         """Compute distances, coordinate transformation, elevation smoothing, and summary statistics"""
@@ -102,10 +146,13 @@ class RideRouteAnimator:
 
         # Compute summary statistics
         self.total_time = (self.times[-1] - self.times[0]).total_seconds()
-        self.elevation_gain = sum(
-            max(self.alts[i] - self.alts[i-1], 0) for i in range(1, len(self.alts))
-        )
-        self.avg_speed_kmh = (self.distances[-1] / self.total_time) * 3.6
+        self.moving_time = self.compute_moving_time()
+        
+        print(f"Total time: {self.total_time/60:.1f} min")
+        print(f"Moving time: {self.moving_time/60:.1f} min")
+        
+        self.elevation_gain = self.compute_elevation_gain()
+        self.avg_speed_kmh = (self.distances[-1] / self.moving_time) * 3.6
         self.avg_hr = self._average_nonzero(self.hr)
         self.avg_cad = self._average_nonzero(self.cad)
 
@@ -122,19 +169,23 @@ class RideRouteAnimator:
         bounds = gdf.total_bounds
 
         # Create figure and subplots for map and elevation
-        fig, (ax_map, ax_elev) = plt.subplots(2, 1, figsize=(12, 9),
-            gridspec_kw={'height_ratios': [10, 2]})
+        figsize= (12, 9)
+        height_ratios = (10, 2)
+        fig, (ax_map, ax_elev) = plt.subplots(2, 1, figsize=figsize,
+            gridspec_kw={'height_ratios': height_ratios})
         fig.set_dpi(self.args.dpi)
+        plt.subplots_adjust(hspace=0)
+        fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
 
         # Plot route line on map
         gdf.plot(ax=ax_map, linewidth=2, color='blue')
 
         # Add margin around route bounds
-        x_margin = (bounds[2] - bounds[0]) * 0.1
-        y_margin = (bounds[3] - bounds[1]) * 0.1
+        x_margin = (bounds[2] - bounds[0]) * 0.01
+        y_margin = (bounds[3] - bounds[1]) * 0.01
         ax_map.set_xlim(bounds[0] - x_margin, bounds[2] + x_margin)
         ax_map.set_ylim(bounds[1] - y_margin, bounds[3] + y_margin)
-
+                
         # Hide axis ticks and labels
         ax_map.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
 
@@ -152,13 +203,25 @@ class RideRouteAnimator:
         marker, = ax_map.plot([], [], 'ro')
 
         # Plot elevation profile
-        self.sampled_distances = self.distances
+        self.sampled_distances = [d / 1000 for d in self.distances]
         ax_elev.plot(self.sampled_distances, self.elevations, color='gray')
-        elev_cursor = ax_elev.axvline(x=0, color='red')
-        ax_map.set_title(self.args.title, fontsize=16)
-        ax_elev.set_title("elevation", fontsize=16)
+        ax_elev.fill_between(self.sampled_distances, self.elevations, color='gray', alpha=0.3)
+        ax_elev.set_ylabel("Elevation (m)", fontsize=10)
+        ax_elev.set_xlabel("Distance (km)")
         ax_elev.tick_params(axis='both', labelsize=8)
-
+        ax_elev.grid(True, linestyle='--', alpha=0.5)
+        ax_elev.set_xlim(min(self.sampled_distances), max(self.sampled_distances))
+        
+        # Plot speed profile
+        ax_speed = ax_elev.twinx()
+        speeds_kmh = [s * 3.6 if s else 0 for s in self.speeds]
+        ax_speed.plot(self.sampled_distances, speeds_kmh, color='blue', alpha=0.5)
+        ax_speed.set_ylabel("Speed (km/h)", fontsize=10)
+        ax_speed.tick_params(axis='y', labelsize=8, labelcolor='blue')
+        
+        elev_cursor = ax_elev.axvline(x=0, color='red')
+        ax_map.set_title(self.args.title, fontsize=14, pad=5)
+        
         # Determine overlay text position
         positions = {
             "top-left":     (0.01, 0.90),
@@ -174,7 +237,7 @@ class RideRouteAnimator:
         def update(frame):
             # Update route marker and elevation cursor
             marker.set_data([self.merc_x[frame]], [self.merc_y[frame]])
-            d = self.distances[frame]
+            d = self.sampled_distances[frame]
             elev_cursor.set_xdata([d, d])
 
             # Extract current metrics
@@ -189,7 +252,7 @@ class RideRouteAnimator:
                 f"Elevation: {elevation:.1f} m\n"
                 f"HR: {hr} bpm\n"
                 f"Cadence: {cad} rpm\n"
-                f"Distance: {d/1000:.2f} km\n"
+                f"Distance: {d:.2f} km\n"
                 f"Elevation Gain: {self.elevation_gain:.1f} m\n"
                 f"Avg Speed: {self.avg_speed_kmh:.1f} km/h\n"
                 f"Avg HR: {self.avg_hr:.0f} bpm\n"
@@ -216,8 +279,12 @@ class RideRouteAnimator:
                 frames=frames,
                 interval=int(1000 / self.args.fps),
                 blit=True
-            )
-            writer = FFMpegWriter(fps=self.args.fps, codec="h264", bitrate=3000)
+            )          
+            
+            if self.args.output.lower().endswith(".gif"):
+                writer = PillowWriter(fps=self.args.fps)
+            else:
+                writer = FFMpegWriter(fps=self.args.fps, codec="h264", bitrate=3000)
             ani.save(self.args.output, writer=writer, dpi=self.args.dpi)
             logger.info(f"Animation saved to: {self.args.output}")
         except Exception as e:

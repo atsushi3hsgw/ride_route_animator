@@ -10,6 +10,7 @@ This tool is designed for customization, extensibility, and beautiful visual sto
 - Displays elevation profile and dynamic overlay statistics  
 - Supports background image, video title, and flexible frame range/step  
 - Outputs MP4 or WebM video using FFmpeg
+- Also supports animated GIF output using PillowWriter
 
 ## Sample Animation
 <img src="images/sample_ride.gif" width="600">
@@ -71,8 +72,40 @@ FFmpeg is required to encode video output.
 
 - Some tile providers may require authentication or block external access (e.g. Strava)  
 - WebM output using VP9 codec may be slower than MP4 (h264)  
-- Background image is applied to the entire figure, not just the map  
 - Frame range and step allow partial or accelerated animations
+
+## Accuracy Notes
+
+Elevation gain and moving time calculations may differ from commercial platforms like Strava or Bryton Active.  
+This is due to differences in smoothing, gradient filtering, and device-specific logic.
+
+- Elevation gain may be overestimated or underestimated depending on terrain and sampling rate  
+- Moving time is computed based on speed thresholds and may not match Strava’s definition  
+- These metrics are best-effort and may evolve with future improvements
+
+## GIF Output
+
+In addition to MP4 and WebM, the tool also supports animated GIF output using PillowWriter.
+
+To generate a GIF:
+
+    python ride_route_animator.py -i activity.fit -o ride.gif
+
+### Notes on GIFs
+
+- GIF rendering is significantly slower than MP4/WebM  
+- Output file size tends to be larger due to limited compression  
+- Color fidelity may be reduced (GIF supports up to 256 colors per frame)
+
+### Optimization Tips
+
+To reduce GIF size and improve performance:
+
+- Use `--step-frame` to skip frames (e.g. `--step-frame 5`)  
+- Lower the resolution with `--dpi` (e.g. `--dpi 80`)  
+- Post-process with [gifsicle](https://www.lcdf.org/gifsicle/) for compression:
+
+      gifsicle -O3 ride.gif -o ride_optimized.gif
 
 ## License
 
