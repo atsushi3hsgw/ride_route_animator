@@ -12,17 +12,27 @@ import geopandas as gpd
 from shapely.geometry import LineString
 import contextily as ctx
 from scipy.signal import savgol_filter
-
-# Set logging level based on environment variable LOG_LEVEL (default: INFO)
-log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=getattr(logging, log_level, logging.INFO),
-                    format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
+from pathlib import Path
 
 class RideRouteAnimator:
-    def __init__(self, args):
+    def __init__(self, input_path: Path, output_path: Path, *, logger=None, **kwargs):
+        
         # Store CLI arguments and initialize data containers
-        self.args = args
+        self.logger = logger or logging.getLogger(__name__)
+
+        self.input_path = input_path    # Input FIT file
+        self.output_path = output_path  # Output video file
+        self.dpi = kwargs.get("dpi", 100)   # Output video DPI
+        self.zoom = kwargs.get("zoom", 13)  # Tile zoom level
+        self.fps = kwargs.get("fps", 10)    # Animation frame rate
+        self.tile = kwargs.get("tile", "OpenStreetMap.Mapnik")  # Tile provider
+        self.no_elevation_smoothing = kwargs.get("no_elevation_smoothing", False)   # Disable elevation smoothing
+        self.overlay_style = kwargs.get("overlay_style", "bottom-right")  # Overlay text position
+        self.title = kwargs.get("title", "")    # Title text
+        self.start_frame = kwargs.get("start_frame", 0) # Start frame index
+        self.end_frame = kwargs.get("end_frame", 0) # End frame index
+        self.step_frame = kwargs.get("step_frame", 10)  # Frame step interval
+        
         self.track = []             # Parsed FIT records
         self.points = []            # (lat, lon) tuples
         self.times = []             # Timestamps
@@ -39,9 +49,9 @@ class RideRouteAnimator:
     def load_fit(self):
         """Load FIT file and extract relevant data fields"""
         try:
-            fitfile = FitFile(self.args.input)
+            fitfile = FitFile(str(self.input_path))
         except Exception as e:
-            logger.error(f"Failed to read FIT file: {e}")
+            self.logger.error(f"Failed to read FIT file: {e}")
             raise SystemExit("Could not read FIT file.")
 
         for record in fitfile.get_messages('record'):
@@ -67,10 +77,10 @@ class RideRouteAnimator:
                     self.hr.append(hr)
                     self.cad.append(cad)
             except Exception as e:
-                logger.warning(f"Skipping malformed record: {e}")
+                self.logger.warning(f"Skipping malformed record: {e}")
 
         if not self.track:
-            logger.error("No valid track points found in FIT file.")
+            self.logger.error("No valid track points found in FIT file.")
             raise SystemExit("No valid data found in FIT file.")
     
     def compute_moving_time(self):
@@ -135,21 +145,21 @@ class RideRouteAnimator:
         ])
 
          # Apply elevation smoothing unless disabled
-        if self.args.no_elevation_smoothing:
+        if self.no_elevation_smoothing:
             self.elevations = self.alts
         else:
             try:
                 self.elevations = savgol_filter(self.alts, window_length=11, polyorder=2)
             except Exception as e:
-                logger.warning(f"Elevation smoothing failed: {e}")
+                self.logger.warning(f"Elevation smoothing failed: {e}")
                 self.elevations = self.alts
 
         # Compute summary statistics
         self.total_time = (self.times[-1] - self.times[0]).total_seconds()
         self.moving_time = self.compute_moving_time()
         
-        print(f"Total time: {self.total_time/60:.1f} min")
-        print(f"Moving time: {self.moving_time/60:.1f} min")
+        self.logger.debug(f"Total time: {self.total_time/60:.1f} min")
+        self.logger.debug(f"Moving time: {self.moving_time/60:.1f} min")
         
         self.elevation_gain = self.compute_elevation_gain()
         self.avg_speed_kmh = (self.distances[-1] / self.moving_time) * 3.6
@@ -173,7 +183,7 @@ class RideRouteAnimator:
         height_ratios = (10, 2)
         fig, (ax_map, ax_elev) = plt.subplots(2, 1, figsize=figsize,
             gridspec_kw={'height_ratios': height_ratios})
-        fig.set_dpi(self.args.dpi)
+        fig.set_dpi(self.dpi)
         plt.subplots_adjust(hspace=0)
         fig.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
 
@@ -191,12 +201,12 @@ class RideRouteAnimator:
 
         # Load background tile map
         try:
-            provider = self.args.tile.split(".")
+            provider = self.tile.split(".")
             tile_source = getattr(ctx.providers[provider[0]], provider[1])
             ctx.add_basemap(ax_map, source=tile_source,
-                            zoom=self.args.zoom, reset_extent=False)
+                            zoom=self.zoom, reset_extent=False)
         except Exception as e:
-            logger.error(f"Failed to load tile provider '{self.args.tile}': {e}")
+            self.logger.error(f"Failed to load tile provider '{self.tile}': {e}")
             raise SystemExit("Failed to load background map. Check --tile option.")
 
         # Initialize route marker
@@ -220,7 +230,7 @@ class RideRouteAnimator:
         ax_speed.tick_params(axis='y', labelsize=8, labelcolor='blue')
         
         elev_cursor = ax_elev.axvline(x=0, color='red')
-        ax_map.set_title(self.args.title, fontsize=14, pad=5)
+        ax_map.set_title(self.title, fontsize=14, pad=5)
         
         # Determine overlay text position
         positions = {
@@ -229,7 +239,7 @@ class RideRouteAnimator:
             "bottom-left":  (0.01, 0.05),
             "bottom-right": (0.75, 0.05),
         }
-        x, y = positions[self.args.overlay_style]
+        x, y = positions[self.overlay_style]
         info_text = ax_map.text(x, y, "", transform=ax_map.transAxes,
                                 fontsize=10, color="white",
                                 bbox=dict(facecolor="black", alpha=0.5))
@@ -261,13 +271,13 @@ class RideRouteAnimator:
             return marker, elev_cursor, info_text
         
         # Determine frame range and step
-        start = max(0, self.args.start_frame)
-        end = self.args.end_frame if self.args.end_frame > 0 else len(self.points)
+        start = max(0, self.start_frame)
+        end = self.end_frame if self.end_frame > 0 else len(self.points)
         end = min(end, len(self.points))
-        step = max(1, self.args.step_frame)
+        step = max(1, self.step_frame)
 
         if start >= end:
-            logger.error(f"Invalid frame range: start={start}, end={end}")
+            self.logger.error(f"Invalid frame range: start={start}, end={end}")
             raise SystemExit("Start frame must be less than end frame.")
 
         frames = range(start, end, step)
@@ -277,28 +287,30 @@ class RideRouteAnimator:
             ani = animation.FuncAnimation(
                 fig, update,
                 frames=frames,
-                interval=int(1000 / self.args.fps),
+                interval=int(1000 / self.fps),
                 blit=True
             )          
             
-            if self.args.output.lower().endswith(".gif"):
-                writer = PillowWriter(fps=self.args.fps)
+            if self.output_path.suffix.lower() == ".gif":
+                writer = PillowWriter(fps=self.fps)
             else:
-                writer = FFMpegWriter(fps=self.args.fps, codec="h264", bitrate=3000)
-            ani.save(self.args.output, writer=writer, dpi=self.args.dpi)
-            logger.info(f"Animation saved to: {self.args.output}")
+                writer = FFMpegWriter(fps=self.fps, codec="h264", bitrate=3000)
+            ani.save(self.output_path, writer=writer, dpi=self.dpi)
+            self.logger.info(f"Animation saved to: {self.output_path}")
         except Exception as e:
-            logger.error(f"Failed to save animation: {e}")
+            self.logger.error(f"Failed to save animation: {e}")
             raise SystemExit("Failed to save video. Check FFmpeg and output path.")
 
     def run(self):
         """Execute the full animation workflow"""
-        logger.info("Loading FIT file...")
+        self.logger.info(f"Loading FIT file {self.input_path}...")
         self.load_fit()
-        logger.info("Computing geometry and statistics...")
+        self.logger.info("Computing geometry and statistics...")
         self.compute_geometry()
-        logger.info("Rendering and saving animation...")
+        self.logger.info("Rendering and saving animation...")
         self.render_animation()
+        
+        return str(self.output_path)
 
 def list_tile_providers():
     """Recursively list available tile providers from contextily.providers"""
@@ -326,6 +338,12 @@ def list_tile_providers():
         print(f"  {t}")
 
 def main():
+    
+    # Set logging level based on environment variable LOG_LEVEL (default: INFO)
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
+    logger = logging.getLogger(__name__)
+    
     parser = argparse.ArgumentParser(description="Generate route animation from FIT file")
     parser.add_argument("-i", "--input", default="input.fit", help="Input FIT file")
     parser.add_argument("-o", "--output", default="output.mp4", help="Output MP4 file")
@@ -352,7 +370,7 @@ def main():
         return
 
     try:
-        RideRouteAnimator(args).run()
+        RideRouteAnimator(Path(args.input), Path(args.output), logger=logger, **vars(args)).run()
     except Exception as e:
         logger.exception("Unexpected error occurred.")
         raise SystemExit("An error occurred during processing. See logs for details.")
